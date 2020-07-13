@@ -208,36 +208,6 @@ class ThreadedProdder(Conditional, Prodder):
 
 class Ompizer(object):
 
-    NESTED = 2
-    """
-    Use nested parallelism if the number of hyperthreads per core is greater
-    than this threshold.
-    """
-
-    COLLAPSE_NCORES = 4
-    """
-    Use a collapse clause if the number of available physical cores is greater
-    than this threshold.
-    """
-
-    COLLAPSE_WORK = 100
-    """
-    Use a collapse clause if the trip count of the collapsable Iterations
-    exceeds this threshold. Note however the trip count is rarely known at
-    compilation time (e.g., this may happen when DefaultDimensions are used).
-    """
-
-    CHUNKSIZE_NONAFFINE = 3
-    """
-    Coefficient to adjust the chunk size in parallelized non-affine Iterations.
-    """
-
-    DYNAMIC_WORK = 10
-    """
-    Use dynamic scheduling if the operation count per iteration exceeds this
-    threshold. Otherwise, use static scheduling.
-    """
-
     lang = {
         'simd-for': c.Pragma('omp simd'),
         'simd-for-aligned': lambda i, j: c.Pragma('omp simd aligned(%s:%d)' % (i, j)),
@@ -251,16 +221,37 @@ class Ompizer(object):
     _Region = OpenMPRegion
     _Iteration = OpenMPIteration
 
-    def __init__(self, sregistry, key=None):
+    def __init__(self, sregistry, options, key=None):
         """
         Parameters
         ----------
         sregistry : SymbolRegistry
             The symbol registry, to quickly access the special symbols that may
             appear in the IET (e.g., `sregistry.threadid`, `sregistry.nthreads`).
+        options : dict
+             The optimization options. Accepted: ['par-collapse-ncores',
+             'par-collapse-work', 'par-chunk-nonaffine', 'par-dynamic-work', 'par-nested']
+             * 'par-collapse-ncores': use a collapse clause if the number of
+               available physical cores is greater than this threshold.
+             * 'par-collapse-work': use a collapse clause if the trip count of the
+               collapsable Iterations is statically known to exceed this threshold.
+             * 'par-chunk-nonaffine': coefficient to adjust the chunk size in
+               non-affine parallel Iterations.
+             * 'par-dynamic-work': use dynamic scheduling if the operation count per
+               iteration exceeds this threshold. Otherwise, use static scheduling.
+             * 'par-nested': nested parallelism if the number of hyperthreads per core
+               is greater than this threshold.
         key : callable, optional
             Return True if an Iteration can be parallelized, False otherwise.
         """
+        self.sregistry = sregistry
+
+        self.collapse_ncores = options['par-collapse-ncores']
+        self.collapse_work = options['par-collapse-work']
+        self.chunk_nonaffine = options['par-chunk-nonaffine']
+        self.dynamic_work = options['par-dynamic-work']
+        self.nested = options['par-nested']
+
         if key is not None:
             self.key = key
         else:
@@ -270,11 +261,10 @@ class Ompizer(object):
                     return False
                 return i.is_ParallelRelaxed and not i.is_Vectorized
             self.key = key
-        self.sregistry = sregistry
 
     def _find_collapsable(self, root, candidates):
         collapsable = []
-        if ncores() >= self.COLLAPSE_NCORES:
+        if ncores() >= self.collapse_ncores:
             for n, i in enumerate(candidates[1:], 1):
                 # The Iteration nest [root, ..., i] must be perfect
                 if not IsPerfectIteration(depth=i).visit(root):
@@ -301,7 +291,7 @@ class Ompizer(object):
                 if nested:
                     try:
                         work = prod([int(j.dim.symbolic_size) for j in nested])
-                        if work < self.COLLAPSE_WORK:
+                        if work < self.collapse_work:
                             break
                     except TypeError:
                         pass
@@ -352,7 +342,7 @@ class Ompizer(object):
         if all(i.is_Affine for i in candidates):
             bundles = FindNodes(ExpressionBundle).visit(root)
             sops = sum(i.ops for i in bundles)
-            if sops >= self.DYNAMIC_WORK:
+            if sops >= self.dynamic_work:
                 schedule = 'dynamic'
             else:
                 schedule = 'static'
@@ -376,7 +366,7 @@ class Ompizer(object):
                                    **root.args)
 
             niters = prod([root.symbolic_size] + [j.symbolic_size for j in collapsable])
-            value = INT(Max(niters / (nthreads*self.CHUNKSIZE_NONAFFINE), 1))
+            value = INT(Max(niters / (nthreads*self.chunk_nonaffine), 1))
             prefix = [Expression(DummyEq(chunk_size, value, dtype=np.int32))]
 
         # Create a ParallelTree
@@ -421,7 +411,7 @@ class Ompizer(object):
 
     def _make_nested_partree(self, partree):
         # Apply heuristic
-        if nhyperthreads() <= Ompizer.NESTED:
+        if nhyperthreads() <= self.nested:
             return partree
 
         # Note: there might be multiple sub-trees amenable to nested parallelism,
